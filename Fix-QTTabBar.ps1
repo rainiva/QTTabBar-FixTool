@@ -4,6 +4,10 @@ param(
     [ValidateSet('1', '2', 'All')][string] $Phase = 'All',
     [switch] $QueryOnly,
     [switch] $VerifyOnly,
+    [switch] $ResetUi,
+    [switch] $ResetLayout,
+    [switch] $SaveSnapshot,
+    [switch] $RestoreSnapshot,
     [switch] $NoRestart,
     [switch] $SkipProbe,
     [switch] $SkipStatusReport,
@@ -14,6 +18,7 @@ $ErrorActionPreference = 'Stop'
 $Script:ToolRoot = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Script:LogDir = Join-Path $ToolRoot 'Logs'
 $Script:BackupDir = Join-Path $ToolRoot 'Backup'
+$Script:SnapshotDir = Join-Path $Script:BackupDir 'Snapshots'
 $Script:LogFile = Join-Path $LogDir ('fix-{0:yyyyMMdd-HHmmss}.log' -f (Get-Date))
 $Script:QTTabBarToolbarClsid = '{D2BF470E-ED1C-487F-A333-2BD8835EB6CE}'
 $Script:QTTabBarLayoutMarker = 'E47BFD21CED7F48A3332BD8835EB6CE'
@@ -26,6 +31,9 @@ $Script:OverridesRoot = 'HKLM:\SYSTEM\CurrentControlSet\Control\FeatureManagemen
 
 function Write-Log {
     param([string]$Message,[ValidateSet('INFO','WARN','ERROR','OK')][string]$Level='INFO')
+    if (-not (Test-Path -LiteralPath $Script:LogDir)) {
+        New-Item -ItemType Directory -Path $Script:LogDir -Force | Out-Null
+    }
     $line = '[{0:yyyy-MM-dd HH:mm:ss}] [{1}] {2}' -f (Get-Date), $Level, $Message
     Add-Content -Path $Script:LogFile -Value $line -Encoding UTF8
     switch ($Level) {
@@ -38,6 +46,305 @@ function Write-Log {
 function Test-IsAdministrator {
     $p = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
     $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+function Ensure-QTTabBarUiInterop {
+    if (-not ([System.Management.Automation.PSTypeName]'QTTabBarFix.NativeMethods').Type) {
+        Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace QTTabBarFix {
+    public static class NativeMethods {
+        [DllImport("user32.dll")]
+        public static extern IntPtr GetForegroundWindow();
+
+        [DllImport("user32.dll")]
+        public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint lpdwProcessId);
+    }
+}
+'@
+    }
+}
+function Get-ForegroundWindowProcessName {
+    Ensure-QTTabBarUiInterop
+    $windowHandle = [QTTabBarFix.NativeMethods]::GetForegroundWindow()
+    if ($windowHandle -eq [IntPtr]::Zero) { return $null }
+    $processId = [uint32]0
+    $null = [QTTabBarFix.NativeMethods]::GetWindowThreadProcessId($windowHandle, [ref]$processId)
+    if ($processId -eq 0) { return $null }
+    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+    if ($null -eq $process) { return $null }
+    return $process.ProcessName
+}
+function Test-IsExplorerForegroundWindow {
+    return (Get-ForegroundWindowProcessName) -eq 'explorer'
+}
+function Send-F11KeyToForegroundWindow {
+    $shell = New-Object -ComObject WScript.Shell
+    $shell.SendKeys('{F11}')
+}
+function Get-QTTabBarLayoutResetTargets {
+    return @(
+        [PSCustomObject]@{
+            KeyPath = 'HKCU:\Software\Microsoft\Internet Explorer\Toolbar\ShellBrowser'
+            ValueName = 'ITBar7Layout'
+            Label = '资源管理器 ShellBrowser band 布局'
+        }
+        [PSCustomObject]@{
+            KeyPath = 'HKCU:\Software\Quizo\QTTabBar\Volatile'
+            ValueName = 'ITBar7Layout'
+            Label = 'QTTabBar Volatile band 布局'
+        }
+    )
+}
+function Get-QTTabBarSnapshotTargets {
+    return @(
+        [PSCustomObject]@{
+            KeyPath = 'HKCU:\Software\Microsoft\Internet Explorer\Toolbar\ShellBrowser'
+            FileName = 'shellbrowser.reg'
+            Label = '资源管理器 ShellBrowser 布局快照'
+        }
+        [PSCustomObject]@{
+            KeyPath = 'HKCU:\Software\Quizo\QTTabBar\Volatile'
+            FileName = 'volatile.reg'
+            Label = 'QTTabBar Volatile 布局快照'
+        }
+    )
+}
+function ConvertTo-CurrentUserRegExePath {
+    param([string]$RegistryPath)
+    if ($RegistryPath -match 'Registry::HKEY_CURRENT_USER\\(.+)$') {
+        return 'HKCU\' + $Matches[1]
+    }
+    if ($RegistryPath -match '^HKCU:\\(.+)$') {
+        return 'HKCU\' + $Matches[1]
+    }
+    if ($RegistryPath -match '^HKEY_CURRENT_USER\\(.+)$') {
+        return 'HKCU\' + $Matches[1]
+    }
+    return $RegistryPath
+}
+function ConvertTo-ProcessArgumentString {
+    param([string[]]$Arguments)
+    $quoted = foreach ($arg in $Arguments) {
+        if ($null -eq $arg) { continue }
+        if ($arg -eq '' -or $arg -match '[\s"]') {
+            '"' + ($arg -replace '"', '\"') + '"'
+        } else {
+            $arg
+        }
+    }
+    return ($quoted -join ' ')
+}
+function Invoke-NativeCommandCapture {
+    param(
+        [Parameter(Mandatory)][string]$FilePath,
+        [string[]]$Arguments = @()
+    )
+    $startInfo = New-Object System.Diagnostics.ProcessStartInfo
+    $startInfo.FileName = $FilePath
+    $startInfo.Arguments = ConvertTo-ProcessArgumentString -Arguments $Arguments
+    $startInfo.UseShellExecute = $false
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $startInfo.CreateNoWindow = $true
+
+    $process = New-Object System.Diagnostics.Process
+    $process.StartInfo = $startInfo
+    if (-not $process.Start()) {
+        throw "无法启动命令: $FilePath"
+    }
+    $stdout = $process.StandardOutput.ReadToEnd()
+    $stderr = $process.StandardError.ReadToEnd()
+    $process.WaitForExit()
+
+    return [PSCustomObject]@{
+        ExitCode = $process.ExitCode
+        Output = $stdout.Trim()
+        Error = $stderr.Trim()
+    }
+}
+function Export-CurrentUserRegistryFile {
+    param(
+        [Parameter(Mandatory)][string]$RegistryPath,
+        [Parameter(Mandatory)][string]$DestinationFile
+    )
+    if (-not (Test-Path -LiteralPath $RegistryPath)) {
+        throw "未找到注册表路径: $RegistryPath"
+    }
+    $parent = Split-Path -Parent $DestinationFile
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    $regPath = ConvertTo-CurrentUserRegExePath $RegistryPath
+    $result = Invoke-NativeCommandCapture -FilePath 'reg.exe' -Arguments @('export', $regPath, $DestinationFile, '/y')
+    if ($result.ExitCode -ne 0) {
+        throw ("注册表备份失败: {0} - {1}" -f $RegistryPath, (($result.Output, $result.Error) -join ' ').Trim())
+    }
+    Write-Log ('已备份: {0}' -f $DestinationFile)
+}
+function Export-CurrentUserRegistryBackup {
+    param([string]$RegistryPath)
+    if (-not (Test-Path -LiteralPath $RegistryPath)) { return $null }
+    $regPath = ConvertTo-CurrentUserRegExePath $RegistryPath
+    $name = $regPath -replace '[\\:]', '_'
+    $backupFile = Join-Path $Script:BackupDir ('{0}-{1:yyyyMMdd-HHmmss}.reg' -f $name, (Get-Date))
+    Export-CurrentUserRegistryFile -RegistryPath $RegistryPath -DestinationFile $backupFile
+    return $backupFile
+}
+function Import-RegistryBackupFile {
+    param([Parameter(Mandatory)][string]$BackupFile)
+    if (-not (Test-Path -LiteralPath $BackupFile)) {
+        throw "未找到注册表备份文件: $BackupFile"
+    }
+    $result = Invoke-NativeCommandCapture -FilePath 'reg.exe' -Arguments @('import', $BackupFile)
+    if ($result.ExitCode -ne 0) {
+        throw ("注册表导入失败: {0} - {1}" -f $BackupFile, (($result.Output, $result.Error) -join ' ').Trim())
+    }
+    Write-Log ('已导回备份: {0}' -f $BackupFile) 'OK'
+}
+function Test-QTTabBarVolatileLayoutPresent {
+    $volatileKey = 'HKCU:\Software\Quizo\QTTabBar\Volatile'
+    if (-not (Test-Path -LiteralPath $volatileKey)) { return $false }
+    $props = Get-ItemProperty -LiteralPath $volatileKey -ErrorAction SilentlyContinue
+    if ($null -eq $props) { return $false }
+    return ($null -ne $props.PSObject.Properties['ITBar7Layout'])
+}
+function Invoke-QTTabBarSnapshotSave {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param()
+
+    Write-Host ''
+    Write-Host '========== QTTabBar 健康快照保存 ==========' -ForegroundColor Cyan
+    Write-Host '将在 Backup\\Snapshots 下保存当前资源管理器/QTTabBar 布局，以便下次直接恢复。' -ForegroundColor Yellow
+
+    $snapshotDir = Join-Path $Script:SnapshotDir ('healthy-{0:yyyyMMdd-HHmmss}' -f (Get-Date))
+    $null = New-Item -ItemType Directory -Path $snapshotDir -Force
+    foreach ($target in Get-QTTabBarSnapshotTargets) {
+        if (-not (Test-Path -LiteralPath $target.KeyPath)) {
+            throw "无法保存健康快照，缺少注册表路径: $($target.KeyPath)"
+        }
+        $destinationFile = Join-Path $snapshotDir $target.FileName
+        if ($PSCmdlet.ShouldProcess($target.KeyPath, 'Export Registry Snapshot')) {
+            Export-CurrentUserRegistryFile -RegistryPath $target.KeyPath -DestinationFile $destinationFile
+            Write-Log ('已保存健康快照项: {0}' -f $destinationFile) 'OK'
+        }
+    }
+
+    Write-Host ('已保存健康快照: {0}' -f $snapshotDir) -ForegroundColor Green
+}
+function Invoke-QTTabBarSnapshotRestore {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([switch]$NoRestart)
+
+    Write-Host ''
+    Write-Host '========== QTTabBar 健康快照恢复 ==========' -ForegroundColor Cyan
+    Write-Host '将恢复最近一次保存的健康快照，再重启资源管理器。' -ForegroundColor Yellow
+
+    if (-not (Test-Path -LiteralPath $Script:SnapshotDir)) {
+        throw '未找到已保存的健康快照。请先在 QTTabBar 正常显示时执行一次快照保存。'
+    }
+    $snapshot = Get-ChildItem -LiteralPath $Script:SnapshotDir -Directory |
+        Sort-Object LastWriteTime -Descending |
+        Select-Object -First 1
+    if ($null -eq $snapshot) {
+        throw '未找到已保存的健康快照。请先在 QTTabBar 正常显示时执行一次快照保存。'
+    }
+
+    foreach ($target in Get-QTTabBarSnapshotTargets) {
+        $backupFile = Join-Path $snapshot.FullName $target.FileName
+        if (-not (Test-Path -LiteralPath $backupFile)) {
+            throw "健康快照不完整，缺少文件: $backupFile"
+        }
+        if ($PSCmdlet.ShouldProcess($backupFile, 'Import Registry Snapshot')) {
+            Import-RegistryBackupFile -BackupFile $backupFile
+        }
+    }
+
+    if (-not $NoRestart -and -not $WhatIfPreference) {
+        Restart-ExplorerShell
+    }
+    Write-Host ('已恢复健康快照: {0}' -f $snapshot.FullName) -ForegroundColor Green
+}
+function Invoke-QTTabBarUiReset {
+    param(
+        [ValidateRange(0, 30)][int]$DelaySeconds = 5,
+        [ValidateRange(0, 5000)][int]$InterKeyDelayMilliseconds = 400
+    )
+
+    Write-Host ''
+    Write-Host '========== QTTabBar UI 重置辅助 ==========' -ForegroundColor Cyan
+    Write-Host '请把目标资源管理器窗口切到前台，本工具会在倒计时结束后发送 F11 两次。' -ForegroundColor Yellow
+    if ($DelaySeconds -gt 0) {
+        Write-Host ("将在 {0} 秒后开始，请立即切回目标资源管理器窗口..." -f $DelaySeconds) -ForegroundColor Yellow
+        Start-Sleep -Seconds $DelaySeconds
+    }
+
+    if (-not (Test-IsExplorerForegroundWindow)) {
+        throw '前台窗口不是资源管理器，已取消发送 F11。请切回目标资源管理器窗口后重试。'
+    }
+
+    Write-Log '前台窗口确认是资源管理器，开始发送 F11 两次重置 UI。'
+    Send-F11KeyToForegroundWindow
+    if ($InterKeyDelayMilliseconds -gt 0) {
+        Start-Sleep -Milliseconds $InterKeyDelayMilliseconds
+    }
+    Send-F11KeyToForegroundWindow
+    Write-Log '已向前台资源管理器发送 F11 两次。' 'OK'
+    Write-Host '如果刚才只剩菜单条或空白条，请回到资源管理器确认 QTTabBar 是否恢复。' -ForegroundColor Green
+}
+function Invoke-QTTabBarLayoutReset {
+    [CmdletBinding(SupportsShouldProcess = $true)]
+    param([switch]$NoRestart)
+
+    Write-Host ''
+    Write-Host '========== QTTabBar 布局重置 ==========' -ForegroundColor Cyan
+    Write-Host '将备份并清除已损坏的 band 布局值，然后重启资源管理器，让 QTTabBar 重新分配标签栏宽度。若新布局未自动生成，本工具会回滚到重置前状态。' -ForegroundColor Yellow
+
+    $removed = 0
+    $backupFiles = @()
+    foreach ($target in Get-QTTabBarLayoutResetTargets) {
+        if (-not (Test-Path -LiteralPath $target.KeyPath)) {
+            Write-Log ('未找到布局键，跳过: {0}' -f $target.KeyPath) 'WARN'
+            continue
+        }
+        $props = Get-ItemProperty -LiteralPath $target.KeyPath -ErrorAction SilentlyContinue
+        if ($null -eq $props -or $null -eq $props.PSObject.Properties[$target.ValueName]) {
+            Write-Log ('未找到布局值，跳过: {0}::{1}' -f $target.KeyPath, $target.ValueName) 'WARN'
+            continue
+        }
+        $backupFile = Export-CurrentUserRegistryBackup -RegistryPath $target.KeyPath
+        if ($backupFile) { $backupFiles += $backupFile }
+        if ($PSCmdlet.ShouldProcess(('{0}::{1}' -f $target.KeyPath, $target.ValueName), 'Delete Registry Value')) {
+            Remove-ItemProperty -LiteralPath $target.KeyPath -Name $target.ValueName -Force
+            $removed++
+            Write-Log ('已清除布局值: {0}::{1} ({2})' -f $target.KeyPath, $target.ValueName, $target.Label) 'OK'
+        }
+    }
+
+    if ($removed -eq 0) {
+        Write-Log '未发现需要重置的布局值。' 'WARN'
+        return
+    }
+
+    Write-Host '已清除持久化布局值。资源管理器重启后，将自动检查 QTTabBar 是否重新生成布局。' -ForegroundColor Green
+    if ($NoRestart -or $WhatIfPreference) {
+        return
+    }
+
+    Restart-ExplorerShell
+    $null = Invoke-QTTabBarProbe
+    if (-not (Test-QTTabBarVolatileLayoutPresent)) {
+        Write-Log '布局重置后未检测到新的 Volatile ITBar7Layout，正在自动回滚到重置前状态。' 'WARN'
+        foreach ($backupFile in $backupFiles) {
+            Import-RegistryBackupFile -BackupFile $backupFile
+        }
+        Restart-ExplorerShell
+        Write-Host '布局重置未成功，已自动回滚到重置前状态。' -ForegroundColor Yellow
+        return
+    }
+
+    Write-Log '布局重置后已检测到新的 Volatile ITBar7Layout。' 'OK'
 }
 function Resolve-ViVeToolPath {
     param([string]$ExplicitPath)
@@ -127,8 +434,7 @@ function Test-QTTabBarModuleLoaded {
 }
 function Test-QTTabBarRuntimeReady {
     param([bool]$ModuleLoaded)
-    if ($ModuleLoaded) { return $true }
-    return Test-QTTabBarToolbarConfigured
+    return $ModuleLoaded
 }
 function Test-QTTabBarAssemblyInstalled {
     $gac = 'C:\Windows\Microsoft.Net\assembly\GAC_MSIL\QTTabBar'
@@ -167,18 +473,20 @@ function Get-QTTabBarHealth {
     $featureTotal = Get-CollectionCount $Status.Features
     if ($featureTotal -eq 0) { $featureTotal = Get-CollectionCount $Script:FeatureMap }
 
-    $configOk = ($disabledCount -eq $featureTotal) -and ((Get-CollectionCount $activeConflicts) -eq 0) -and ((Get-CollectionCount $leftoverKeys) -eq 0) -and $toolbarConfigured -and $assemblyInstalled
+    $systemConfigOk = ($disabledCount -eq $featureTotal) -and ((Get-CollectionCount $activeConflicts) -eq 0) -and ((Get-CollectionCount $leftoverKeys) -eq 0) -and $assemblyInstalled
+    $configOk = $systemConfigOk -and $toolbarConfigured
+    $visualCheckRequired = $configOk
 
     $overall = 'unknown'
     $summary = ''
-    if ($configOk -and $runtimeReady) {
-        $overall = 'healthy'
-        if ($ModuleLoaded) {
-            $summary = 'QTTabBar 配置与运行状态正常，标签栏应可正常使用。'
+    if ($visualCheckRequired) {
+        $overall = 'visual_check_required'
+        if ($runtimeReady) {
+            $summary = '已检测到 QTTabBar 模块，配置也已就绪，但仍需在资源管理器中确认真正的 QTTabBar 标签页是否可见，而不只是菜单条。若之前已保存健康快照，优先恢复快照；否则请先按 F11 两次，仍无效时再尝试实验性布局重置（失败会自动回滚）。'
         } else {
-            $summary = 'QTTabBar 配置正常，工具栏已启用。标签栏应可正常使用。（.NET 插件通常无法通过 DLL 枚举检测）'
+            $summary = 'QTTabBar 配置已就绪，但尚未确认标签栏真实可见。若资源管理器里只剩菜单条或标签栏被挤成细条，若之前已保存健康快照，优先恢复快照；否则请先按 F11 两次，仍无效时再尝试实验性布局重置（失败会自动回滚）。'
         }
-    } elseif ($configOk -and -not $runtimeReady) {
+    } elseif ($systemConfigOk -and -not $toolbarConfigured) {
         $overall = 'config_only'
         $summary = '配置层面正常，但工具栏未启用。请打开资源管理器 → 查看 → 选项 → 勾选 QTTabBar。'
     } elseif (-not $configOk -and $runtimeReady) {
@@ -200,8 +508,10 @@ function Get-QTTabBarHealth {
         AssemblyInstalled=$assemblyInstalled
         ModuleLoaded=$ModuleLoaded
         RuntimeReady=$runtimeReady
+        VisualCheckRequired=$visualCheckRequired
         ProbedExplorer=$ProbedExplorer
         ConfigOk=$configOk
+        SystemConfigOk=$systemConfigOk
         RuntimeOk=$runtimeReady
     }
 }
@@ -232,6 +542,7 @@ function Show-HealthReport {
     Write-Host '========== QTTabBar 健康检测 ==========' -ForegroundColor Cyan
     $color = switch ($Health.Overall) {
         'healthy' { 'Green' }
+        'visual_check_required' { 'Yellow' }
         'config_only' { 'Yellow' }
         'runtime_only' { 'Yellow' }
         default { 'Red' }
@@ -245,9 +556,10 @@ function Show-HealthReport {
     }
     Write-Host ('  工具栏布局已配置 QTTabBar: {0}' -f $(if ($Health.ToolbarConfigured) { '是' } else { '否' }))
     Write-Host ('  QTTabBar 程序集已安装: {0}' -f $(if ($Health.AssemblyInstalled) { '是' } else { '否' }))
-    Write-Host ('  运行状态就绪 (工具栏/DLL): {0}' -f $(if ($Health.RuntimeReady) { '是' } else { '否' }))
+    Write-Host ('  已检测到 QTTabBar 模块: {0}' -f $(if ($Health.RuntimeReady) { '是' } else { '否' }))
+    Write-Host ('  仍需人工确认标签栏可见: {0}' -f $(if ($Health.VisualCheckRequired) { '是' } else { '否' }))
     if (-not $Health.ModuleLoaded) {
-        Write-Host '  Explorer DLL 枚举: 未检出（.NET 插件常见，不代表未运行）' -ForegroundColor DarkGray
+        Write-Host '  Explorer DLL 枚举: 未检出（无法仅凭工具栏注册判断标签栏真实可见）' -ForegroundColor DarkGray
     } else {
         Write-Host '  Explorer DLL 枚举: 已检出 QTTabBar.dll'
     }
@@ -257,6 +569,7 @@ function Show-HealthReport {
     Write-Host ''
     switch ($Health.Overall) {
         'healthy' { Write-Host '结论: 通过' -ForegroundColor Green }
+        'visual_check_required' { Write-Host '结论: 部分通过（需在资源管理器中确认标签栏，而不只是菜单条）' -ForegroundColor Yellow }
         'config_only' { Write-Host '结论: 部分通过（需手动启用工具栏或重启电脑）' -ForegroundColor Yellow }
         'runtime_only' { Write-Host '结论: 部分通过（建议继续修复或重启）' -ForegroundColor Yellow }
         default { Write-Host '结论: 未通过' -ForegroundColor Red }
@@ -318,8 +631,10 @@ function Export-RegistryBackup {
     $name = (ConvertTo-RegExePath $providerPath) -replace '[\\:]', '_'
     $backupFile = Join-Path $Script:BackupDir ('{0}-{1:yyyyMMdd-HHmmss}.reg' -f $name, (Get-Date))
     $regPath = ConvertTo-RegExePath $providerPath
-    $proc = Start-Process reg.exe -ArgumentList @('export', $regPath, $backupFile, '/y') -Wait -PassThru -WindowStyle Hidden
-    if ($proc.ExitCode -ne 0) { throw "注册表备份失败: $RegistryPath" }
+    $result = Invoke-NativeCommandCapture -FilePath 'reg.exe' -Arguments @('export', $regPath, $backupFile, '/y')
+    if ($result.ExitCode -ne 0) {
+        throw ("注册表备份失败: {0} - {1}" -f $RegistryPath, (($result.Output, $result.Error) -join ' ').Trim())
+    }
     Write-Log ('已备份: {0}' -f $backupFile)
     return $backupFile
 }
@@ -513,9 +828,9 @@ function Invoke-RegDeleteAsSystem {
 }
 function Invoke-RegDeleteKey {
     param([string]$RegPath)
-    $output = & reg.exe delete $RegPath /f 2>&1 | Out-String
-    if ($LASTEXITCODE -ne 0) {
-        throw ("reg.exe delete 失败 (exit {0}): {1} - {2}" -f $LASTEXITCODE, $RegPath, $output.Trim())
+    $result = Invoke-NativeCommandCapture -FilePath 'reg.exe' -Arguments @('delete', $RegPath, '/f')
+    if ($result.ExitCode -ne 0) {
+        throw ("reg.exe delete 失败 (exit {0}): {1} - {2}" -f $result.ExitCode, $RegPath, (($result.Output, $result.Error) -join ' ').Trim())
     }
 }
 function Remove-RegistryKeyForce {
@@ -624,18 +939,29 @@ function Show-PostFixGuide {
     $buildLabel = '{0}.{1}' -f $ver.CurrentBuild, $ver.UBR
     Write-Host ''
     Write-Host '========== 修复后操作指引 ==========' -ForegroundColor Cyan
-    if ($Health.Overall -ne 'healthy') {
+    if ($Health.Overall -eq 'visual_check_required') {
+        Write-Host '1. 打开资源管理器，确认是否看到真正的 QTTabBar 标签页'
+        Write-Host '2. 标签页正常时，可先在菜单选 [4] 保存一份健康快照'
+        Write-Host '3. 若只剩菜单条：先按 F11 两次，或在菜单选 [3] 自动发送'
+        Write-Host '4. 若之前保存过健康快照：优先用菜单 [5] 恢复最近一次健康快照'
+        Write-Host '5. 若标签栏被挤成细条且没有可恢复的快照：可用命令行 -ResetLayout 尝试实验性布局重置（失败会自动回滚）'
+        Write-Host '6. 若仍异常：重启资源管理器或直接重启电脑'
+    } elseif ($Health.Overall -ne 'healthy') {
         Write-Host ('1. 建议重启电脑（当前 Build {0} 通常需要完整重启）' -f $buildLabel)
         Write-Host '2. 打开资源管理器 → 查看 → 选项 → 勾选 QTTabBar'
-        Write-Host '3. 若标签栏空白：按 F11 两次 重置 UI'
-        Write-Host '4. 可在菜单选 [6] 再次运行健康检测'
+        Write-Host '3. 若只剩菜单条：先按 F11 两次，或在菜单选 [3] 自动发送'
+        Write-Host '4. 若之前保存过健康快照：优先用菜单 [5] 恢复最近一次健康快照'
+        Write-Host '5. 若标签栏被挤成细条且没有可恢复的快照：可用命令行 -ResetLayout 尝试实验性布局重置（失败会自动回滚）'
+        Write-Host '6. 可在菜单选 [2] 再次运行健康检测'
     } else {
-        Write-Host '1. 若标签栏仍不可见，按 F11 两次 或重启电脑'
-        Write-Host '2. 可在菜单选 [6] 再次运行健康检测'
-        Write-Host ('3. 可选：运行 [7] 快速清理残留注册表键（当前 {0} 个，非必须）' -f $Health.RegistryLeftoverKeys)
+        Write-Host '1. 趁标签栏正常时，建议先用菜单 [4] 保存一份健康快照'
+        Write-Host '2. 若标签栏以后再次不可见，先按 F11 两次或用菜单 [3] 自动发送'
+        Write-Host '3. 若之前保存过健康快照，优先用菜单 [5] 直接恢复'
+        Write-Host '4. 若仍只剩菜单条或标签栏被挤成细条，可用命令行 -ResetLayout 尝试实验性布局重置（失败会自动回滚）'
+        Write-Host ('5. 若需要高级清理，可用命令行 -Phase 2 -NoRestart（当前残留键 {0} 个，非必须）' -f $Health.RegistryLeftoverKeys)
     }
-    Write-Host ('5. 日志: {0}' -f $Script:LogFile)
-    Write-Host ('6. 备份: {0}' -f $Script:BackupDir)
+    Write-Host ('日志: {0}' -f $Script:LogFile)
+    Write-Host ('备份: {0}' -f $Script:BackupDir)
     Write-Host '参考: https://github.com/indiff/qttabbar/issues/429'
 }
 
@@ -645,6 +971,10 @@ function Invoke-QTTabBarFixCore {
         [ValidateSet('1', '2', 'All')][string] $Phase = 'All',
         [switch] $QueryOnly,
         [switch] $VerifyOnly,
+        [switch] $ResetUi,
+        [switch] $ResetLayout,
+        [switch] $SaveSnapshot,
+        [switch] $RestoreSnapshot,
         [switch] $NoRestart,
         [switch] $SkipProbe,
         [switch] $SkipStatusReport,
@@ -658,6 +988,26 @@ function Invoke-QTTabBarFixCore {
     New-Item -ItemType Directory -Path $Script:LogDir -Force | Out-Null
     New-Item -ItemType Directory -Path $Script:BackupDir -Force | Out-Null
     Write-Log 'QTTabBar 两阶段修复工具启动'
+    if ($ResetUi) {
+        Write-Log '启动 QTTabBar UI 重置辅助'
+        Invoke-QTTabBarUiReset
+        return
+    }
+    if ($ResetLayout) {
+        Write-Log '启动 QTTabBar 布局重置'
+        Invoke-QTTabBarLayoutReset -NoRestart:$NoRestart
+        return
+    }
+    if ($SaveSnapshot) {
+        Write-Log '启动 QTTabBar 健康快照保存'
+        Invoke-QTTabBarSnapshotSave
+        return
+    }
+    if ($RestoreSnapshot) {
+        Write-Log '启动 QTTabBar 健康快照恢复'
+        Invoke-QTTabBarSnapshotRestore -NoRestart:$NoRestart
+        return
+    }
     $viveExe = Resolve-ViVeToolPath -ExplicitPath $ViVeToolPath
     Write-Log ('ViVeTool 路径: {0}' -f $viveExe)
     $status = Get-QTTabBarFixStatus -ViVeExe $viveExe

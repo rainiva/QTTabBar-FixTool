@@ -39,16 +39,14 @@ function Request-Administrator {
 function Show-Menu {
     Write-Host ''
     Write-Host '========================================' -ForegroundColor Cyan
-    Write-Host '  QTTabBar 两阶段全面修复工具' -ForegroundColor Cyan
+    Write-Host '  QTTabBar 修复工具' -ForegroundColor Cyan
     Write-Host '========================================' -ForegroundColor Cyan
     Write-Host ''
     Write-Host '  [1] 完整修复（阶段一 + 阶段二）推荐'
-    Write-Host '  [2] 仅阶段一（ViVeTool 禁用功能包）'
-    Write-Host '  [3] 仅阶段二（清理冲突注册表键）'
-    Write-Host '  [4] 仅查询当前状态'
-    Write-Host '  [5] 模拟运行（不实际修改）'
-    Write-Host '  [6] 健康检测（检测 QTTabBar 是否可用）'
-    Write-Host '  [7] 快速清理残留注册表键（不重启资源管理器）'
+    Write-Host '  [2] 健康检测'
+    Write-Host '  [3] UI 重置辅助（向前台资源管理器发送 F11 两次）'
+    Write-Host '  [4] 保存当前健康快照'
+    Write-Host '  [5] 恢复最近一次健康快照'
     Write-Host '  [0] 退出'
     Write-Host ''
 }
@@ -62,6 +60,10 @@ function ConvertTo-WorkerParams {
         SkipProbe = $false
         SkipStatusReport = $false
         WhatIf = $false
+        ResetUi = $false
+        ResetLayout = $false
+        SaveSnapshot = $false
+        RestoreSnapshot = $false
         ViVeToolPath = $null
     }
     for ($i = 0; $i -lt $WorkerArgs.Count; $i++) {
@@ -73,6 +75,10 @@ function ConvertTo-WorkerParams {
             '-SkipProbe' { $result.SkipProbe = $true; break }
             '-SkipStatusReport' { $result.SkipStatusReport = $true; break }
             '-WhatIf' { $result.WhatIf = $true; break }
+            '-ResetUi' { $result.ResetUi = $true; break }
+            '-ResetLayout' { $result.ResetLayout = $true; break }
+            '-SaveSnapshot' { $result.SaveSnapshot = $true; break }
+            '-RestoreSnapshot' { $result.RestoreSnapshot = $true; break }
             '-ViVeToolPath' { $result.ViVeToolPath = $WorkerArgs[++$i]; break }
         }
     }
@@ -91,6 +97,10 @@ function Invoke-Worker {
         NoRestart = [bool]$parsed.NoRestart
         SkipProbe = [bool]$parsed.SkipProbe
         SkipStatusReport = [bool]$parsed.SkipStatusReport
+        ResetUi = [bool]$parsed.ResetUi
+        ResetLayout = [bool]$parsed.ResetLayout
+        SaveSnapshot = [bool]$parsed.SaveSnapshot
+        RestoreSnapshot = [bool]$parsed.RestoreSnapshot
     }
     if ($parsed.ViVeToolPath) { $splat.ViVeToolPath = [string]$parsed.ViVeToolPath }
     if ($parsed.WhatIf) {
@@ -103,12 +113,10 @@ function Invoke-MenuChoice {
     param([string]$Choice)
     switch ($Choice) {
         '1' { Invoke-Worker -WorkerArgs @('-Phase', 'All') }
-        '2' { Invoke-Worker -WorkerArgs @('-Phase', '1') }
-        '3' { Invoke-Worker -WorkerArgs @('-Phase', '2') }
-        '4' { Invoke-Worker -WorkerArgs @('-QueryOnly') }
-        '5' { Invoke-Worker -WorkerArgs @('-Phase', 'All', '-WhatIf') }
-        '6' { Invoke-Worker -WorkerArgs @('-VerifyOnly', '-SkipProbe') }
-        '7' { Invoke-Worker -WorkerArgs @('-Phase', '2', '-NoRestart', '-SkipStatusReport', '-SkipProbe') }
+        '2' { Invoke-Worker -WorkerArgs @('-VerifyOnly', '-SkipProbe') }
+        '3' { Invoke-Worker -WorkerArgs @('-ResetUi') }
+        '4' { Invoke-Worker -WorkerArgs @('-SaveSnapshot') }
+        '5' { Invoke-Worker -WorkerArgs @('-RestoreSnapshot') }
         '0' { return $false }
         default {
             Write-Host '无效选项，请重新输入。' -ForegroundColor Yellow
@@ -172,7 +180,7 @@ do {
         $Script:WorkerScriptHash = $currentHash
     }
     Show-Menu
-    $choice = Read-Host '请选择 [0-7]'
+    $choice = Read-Host '请选择 [0-5]'
     if ($choice -eq '0') { break }
     try {
         [void](Invoke-MenuChoice -Choice $choice)
